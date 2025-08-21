@@ -1,0 +1,22 @@
+model:
+  name: "microsoft/codebert-base"
+  hidden_dim: 768
+  dropout: 0.1
+
+training:
+  batch_size: 8
+  learning_rate: 2e-5
+  num_epochs: 5
+  weight_decay: 0.01
+
+data:
+  max_sequence_length: 512
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+
+evaluation:
+  metrics: ["accuracy", "f1", "precision", "recall", "auc"]
+  generate_explanations: true
+
+data_limit: 500
