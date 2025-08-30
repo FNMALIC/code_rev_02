@@ -4,14 +4,47 @@ import json
 import subprocess
 from pathlib import Path
 import logging
-
+import tempfile
+import shutil
+from .diff_parser import GitDiffParser
 logger = logging.getLogger(__name__)
 
 
 class GitIntegration:
     def __init__(self, repo_path: str):
-        self.repo_path = Path(repo_path)
-        self.repo = git.Repo(repo_path) if self.repo_path.exists() else None
+        self.repo_path = repo_path
+        self.temp_dir = None
+        self.repo = None
+        self.diff_parser = GitDiffParser()
+
+        # Check if it's a URL or local path
+        if repo_path.startswith(('http://', 'https://', 'git@')):
+            # Clone the repository to a temporary directory
+            self.temp_dir = tempfile.mkdtemp()
+            try:
+                logger.info(f"Cloning repository from {repo_path} to {self.temp_dir}")
+                self.repo = git.Repo.clone_from(repo_path, self.temp_dir)
+                self.repo_path = Path(self.temp_dir)
+            except Exception as e:
+                logger.error(f"Failed to clone repository: {e}")
+                self.repo = None
+        else:
+            # Local repository
+            self.repo_path = Path(repo_path)
+            if self.repo_path.exists():
+                try:
+                    self.repo = git.Repo(repo_path)
+                except Exception as e:
+                    logger.error(f"Failed to open repository: {e}")
+                    self.repo = None
+            else:
+                logger.error(f"Repository not found at {self.repo_path}")
+                self.repo = None
+
+    def __del__(self):
+        """Cleanup temporary directory if created"""
+        if self.temp_dir and Path(self.temp_dir).exists():
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def get_current_diff(self) -> str:
         """Get unstaged changes"""
@@ -85,7 +118,6 @@ class GitIntegration:
                 'line_number': line_number,
                 'comment': comment,
                 'commit_hash': commit_hash or 'current',
-                # 'timestamp': pd.Timestamp.now().isoformat()
             }
 
             # Save to review file (in real implementation, this would integrate with GitHub/GitLab API)

@@ -12,14 +12,16 @@ class CodePreprocessor:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.max_length = 512
 
+    def preprocess_code(self, code: str) -> str:  # <-- ADDED: This is the method that main.py was looking for
+        """Main preprocessing method that the main script expects"""
+        return self.clean_code(code)
+
     def clean_code(self, code: str) -> str:
         """Clean and normalize code"""
         code = re.sub(r'\n\s*\n', '\n', code)
-
         code = re.sub(r'#.*', '', code)
         code = re.sub(r'""".*?"""', '', code, flags=re.DOTALL)
         code = re.sub(r"'''.*?'''", '', code, flags=re.DOTALL)
-
         return code.strip()
 
     def tokenize_code(self, code: str) -> Dict:
@@ -45,7 +47,6 @@ class CodePreprocessor:
             'avg_line_length': sum([len(l) for l in lines]) / len(lines) if lines else 0
         }
 
-        # Try to parse and get more metrics
         try:
             tree = ast.parse(code)
             metrics.update(self._ast_metrics(tree))
@@ -56,7 +57,6 @@ class CodePreprocessor:
 
     def _ast_metrics(self, tree) -> Dict:
         """Extract AST-based metrics"""
-
         class MetricsVisitor(ast.NodeVisitor):
             def __init__(self):
                 self.functions = 0

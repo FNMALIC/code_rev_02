@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import logging
 from pathlib import Path
 
@@ -15,6 +15,21 @@ class InterpretabilityAnalyzer:
     def __init__(self, save_path: str = "results/interpretability"):
         self.save_path = Path(save_path)
         self.save_path.mkdir(parents=True, exist_ok=True)
+
+    def get_feature_importance(self, model: Any, X_sample: np.ndarray) -> List[Tuple[str, float]]:
+        """Get feature importance for a specific model and sample"""
+        try:
+            if hasattr(model, 'feature_importances_'):
+                # Tree-based models
+                importances = model.feature_importances_
+                feature_names = [f"feature_{i}" for i in range(len(importances))]
+                return list(zip(feature_names, importances))
+            else:
+                # For other models, use permutation importance or return empty
+                return []
+        except Exception as e:
+            logger.error(f"Error getting feature importance: {e}")
+            return []
 
     def generate_shap_explanations(self,
                                    model: Any,

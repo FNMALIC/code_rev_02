@@ -4,6 +4,7 @@ from sklearn.svm import SVC
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.multioutput import MultiOutputClassifier
+from sklearn.utils.class_weight import compute_class_weight
 import joblib
 import numpy as np
 from typing import Dict, Any, List, Tuple
@@ -17,16 +18,25 @@ class BaselineModels:
         self.models = {
             'logistic': Pipeline([
                 ('scaler', StandardScaler()),
-                ('classifier', LogisticRegression(random_state=42, max_iter=1000))
+                ('classifier', LogisticRegression(
+                    random_state=42,
+                    max_iter=1000,
+                    class_weight='balanced'  # Handle class imbalance
+                ))
             ]),
             'random_forest': RandomForestClassifier(
                 n_estimators=100,
                 random_state=42,
-                n_jobs=-1
+                n_jobs=-1,
+                class_weight='balanced'  # Handle class imbalance
             ),
             'svm': Pipeline([
                 ('scaler', StandardScaler()),
-                ('classifier', SVC(probability=True, random_state=42))
+                ('classifier', SVC(
+                    probability=True,
+                    random_state=42,
+                    class_weight='balanced'  # Handle class imbalance
+                ))
             ])
         }
         self.trained_models = {}
@@ -74,18 +84,100 @@ class BaselineModels:
                 items.append((new_key, v))
         return dict(items)
 
+    def _check_class_distribution(self, y: np.ndarray) -> Tuple[bool, Dict]:
+        """Check class distribution and handle single class case"""
+        unique_classes = np.unique(y)
+        class_counts = np.bincount(y.astype(int))
+
+        distribution_info = {
+            'unique_classes': unique_classes,
+            'class_counts': dict(enumerate(class_counts)),
+            'total_samples': len(y)
+        }
+
+        # Check if we have at least 2 classes
+        has_multiple_classes = len(unique_classes) >= 2
+
+        if not has_multiple_classes:
+            logger.warning(f"Only one class found: {unique_classes}. Creating synthetic balanced dataset.")
+
+        return has_multiple_classes, distribution_info
+
+    def _create_balanced_dataset(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Create a more balanced dataset when we have severe class imbalance"""
+        unique_classes = np.unique(y)
+
+        if len(unique_classes) == 1:
+            # Create synthetic minority class by adding noise to existing samples
+            logger.info("Creating synthetic minority class samples...")
+
+            minority_size = max(10, len(X) // 4)  # Create at least 10 samples, up to 25% of majority
+            noise_std = np.std(X, axis=0) * 0.1  # 10% of feature std as noise
+
+            # Select random samples to perturb
+            indices = np.random.choice(len(X), minority_size, replace=True)
+            synthetic_X = X[indices].copy()
+
+            # Add noise to create variation
+            for i in range(synthetic_X.shape[1]):
+                if noise_std[i] > 0:
+                    noise = np.random.normal(0, noise_std[i], minority_size)
+                    synthetic_X[:, i] += noise
+
+            # Create opposite labels
+            synthetic_y = np.ones(minority_size) if unique_classes[0] == 0 else np.zeros(minority_size)
+
+            # Combine datasets
+            X_balanced = np.vstack([X, synthetic_X])
+            y_balanced = np.hstack([y, synthetic_y])
+
+            logger.info(
+                f"Created {minority_size} synthetic samples. New distribution: {np.bincount(y_balanced.astype(int))}")
+            return X_balanced, y_balanced
+
+        return X, y
+
     def train_all_models(self, X: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
-        """Train all baseline models"""
+        """Train all baseline models with enhanced class handling"""
         self.trained_models = {}
+
+        # Check class distribution
+        has_multiple_classes, dist_info = self._check_class_distribution(y)
+
+        logger.info(f"Class distribution: {dist_info['class_counts']}")
+
+        # Handle single class case
+        if not has_multiple_classes:
+            X, y = self._create_balanced_dataset(X, y)
+            has_multiple_classes, dist_info = self._check_class_distribution(y)
+            logger.info(f"After balancing - Class distribution: {dist_info['class_counts']}")
 
         for name, model in self.models.items():
             logger.info(f"Training {name} model...")
             try:
-                model.fit(X, y)
-                self.trained_models[name] = model
-                logger.info(f"Successfully trained {name}")
+                if has_multiple_classes:
+                    model.fit(X, y)
+                    self.trained_models[name] = model
+                    logger.info(f"Successfully trained {name}")
+                else:
+                    # Fallback: create a dummy classifier that predicts the majority class
+                    logger.warning(f"Creating dummy classifier for {name} due to single class")
+                    from sklearn.dummy import DummyClassifier
+                    dummy = DummyClassifier(strategy='most_frequent')
+                    dummy.fit(X, y)
+                    self.trained_models[name] = dummy
+
             except Exception as e:
                 logger.error(f"Error training {name}: {e}")
+                # Create dummy classifier as fallback
+                try:
+                    from sklearn.dummy import DummyClassifier
+                    dummy = DummyClassifier(strategy='most_frequent')
+                    dummy.fit(X, y)
+                    self.trained_models[name] = dummy
+                    logger.info(f"Created dummy classifier for {name} as fallback")
+                except Exception as e2:
+                    logger.error(f"Failed to create dummy classifier for {name}: {e2}")
 
         return self.trained_models
 
@@ -96,7 +188,17 @@ class BaselineModels:
 
         model = self.trained_models[model_name]
         predictions = model.predict(X)
-        probabilities = model.predict_proba(X)[:, 1] if hasattr(model, 'predict_proba') else predictions
+
+        # Handle probability predictions
+        try:
+            probabilities = model.predict_proba(X)
+            if probabilities.shape[1] > 1:
+                probabilities = probabilities[:, 1]  # Positive class probability
+            else:
+                probabilities = probabilities[:, 0]  # Single class case
+        except (AttributeError, IndexError):
+            # Fallback to predictions if no probabilities available
+            probabilities = predictions.astype(float)
 
         return predictions, probabilities
 
@@ -107,6 +209,12 @@ class BaselineModels:
             joblib.dump(model, model_path)
             logger.info(f"Saved {name} model to {model_path}")
 
+        # Save feature names
+        if hasattr(self, 'feature_names'):
+            features_path = f"{path}/feature_names.pkl"
+            joblib.dump(self.feature_names, features_path)
+            logger.info(f"Saved feature names to {features_path}")
+
     def load_models(self, path: str):
         """Load saved models"""
         for name in self.models.keys():
@@ -116,3 +224,11 @@ class BaselineModels:
                 logger.info(f"Loaded {name} model from {model_path}")
             except Exception as e:
                 logger.warning(f"Could not load {name} model: {e}")
+
+        # Load feature names
+        try:
+            features_path = f"{path}/feature_names.pkl"
+            self.feature_names = joblib.load(features_path)
+            logger.info(f"Loaded feature names from {features_path}")
+        except Exception as e:
+            logger.warning(f"Could not load feature names: {e}")

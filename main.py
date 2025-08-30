@@ -1,13 +1,17 @@
 import argparse
+import ast
 import json
-
 import yaml
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import logging
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.utils import resample
 
 from src.utils.logging_config import setup_logging
 from src.data.loader import CodeReviewDataLoader
@@ -16,242 +20,835 @@ from src.features.ast_features import ASTFeatureExtractor
 from src.features.graph_features import GraphFeatureExtractor
 from src.models.baselines import BaselineModels
 from src.models.codebert_model import CodeBERTMultiTask
-from src.models.mil_model import MultiInstanceLearning
 from src.evaluation.metrics import ModelEvaluator
 from src.evaluation.interpretability import InterpretabilityAnalyzer
 from src.integration.git_integration import GitIntegration
+from src.features.enhanced_labeling import (
+    generate_realistic_labels,
+    extract_enhanced_features,
+    prepare_improved_baseline_features,
+    preprocess_code_fragment,
+    analyze_label_distribution
+)
 
 logger = logging.getLogger(__name__)
+
+
+class CompleteCodeReviewSystem:
+    """
+    Complete automated code review system that integrates all components:
+    1. Preprocesses code using CodePreprocessor
+    2. Extracts AST and graph features
+    3. Uses CodeBERT for deep learning analysis
+    4. Provides interpretable feedback
+    5. Generates automated review comments
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.model_path = Path("models/codebert")
+        self.model_path.mkdir(parents=True, exist_ok=True)
+
+        # Initialize all components
+        self.preprocessor = CodePreprocessor()
+        self.ast_extractor = ASTFeatureExtractor()
+        self.graph_extractor = GraphFeatureExtractor()
+        self.baseline_models = BaselineModels()
+        self.codebert_model = CodeBERTMultiTask(
+            model_name=config['model']['name'],
+            dropout_rate=config['model'].get('dropout', 0.1)
+        )
+        self.evaluator = ModelEvaluator()
+        self.interpretability = InterpretabilityAnalyzer()
+
+        # State tracking
+        self.is_trained = False
+        self.feature_extractors_ready = False
+
+        # Try to load existing model
+        self._load_existing_models()
+
+    def _load_existing_models(self):
+        """Load existing trained models if they exist"""
+        codebert_path = self.model_path / "codebert_complete.pth"
+        baseline_path = "models/baseline"
+
+        # Load CodeBERT model
+        if codebert_path.exists():
+            try:
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                self.codebert_model.load_state_dict(torch.load(codebert_path, map_location=device))
+                self.codebert_model.to(device)
+                logger.info("Loaded existing CodeBERT model")
+                self.is_trained = True
+            except Exception as e:
+                logger.warning(f"Failed to load CodeBERT model: {e}")
+
+        # Load baseline models
+        if Path(baseline_path).exists():
+            try:
+                self.baseline_models.load_models(baseline_path)
+                logger.info("Loaded existing baseline models")
+            except Exception as e:
+                logger.warning(f"Failed to load baseline models: {e}")
+
+    def train_all_models(self, commits_data: List[Dict], force_retrain: bool = False) -> Dict[str, Any]:
+        """Train all models in the system"""
+
+        # Check if models already exist and we're not forcing retrain
+        if self.is_trained and not force_retrain:
+            logger.info("Models already trained. Use force_retrain=True to retrain.")
+            return {"status": "already_trained", "message": "Models loaded from disk"}
+
+        logger.info("Training complete code review system...")
+
+        # Generate synthetic data if needed
+        if len(commits_data) < 50:
+            commits_data = self.generate_synthetic_commits(commits_data, target_size=100)
+
+        # Prepare comprehensive features
+        X, y, samples = self.prepare_comprehensive_features(commits_data)
+
+        if X.size == 0:
+            logger.error("No features extracted. Cannot train models.")
+            return {}
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42,
+            stratify=y if len(np.unique(y)) > 1 else None
+        )
+
+        train_samples = samples[:len(X_train)]
+        test_samples = samples[len(X_train):]
+
+        results = {}
+
+        # 1. Train baseline models (only if not already trained or force retrain)
+        if not self.baseline_models.trained_models or force_retrain:
+            logger.info("Training baseline models...")
+            baseline_models = self.baseline_models.train_all_models(X_train, y_train)
+            # Save baseline models
+            baseline_path = "models/baseline"
+            Path(baseline_path).mkdir(parents=True, exist_ok=True)
+            self.baseline_models.save_models(baseline_path)
+            results['baseline_models'] = baseline_models
+        else:
+            logger.info("Using existing baseline models")
+            results['baseline_models'] = "loaded_existing"
+
+        # 2. Train CodeBERT model (only if not already trained or force retrain)
+        codebert_path = self.model_path / "codebert_complete.pth"
+        if not codebert_path.exists() or force_retrain:
+            logger.info("Training CodeBERT model...")
+            codebert_results = self.train_codebert(train_samples, test_samples)
+            results['codebert'] = codebert_results
+        else:
+            logger.info("Using existing CodeBERT model")
+            results['codebert'] = "loaded_existing"
+
+        # 3. Evaluate all models
+        logger.info("Evaluating models...")
+        evaluation_results = self.evaluate_models(X_test, y_test, test_samples)
+        results['evaluation'] = evaluation_results
+
+        # 4. Generate interpretability analysis
+        logger.info("Generating interpretability analysis...")
+        interpretability_results = self.analyze_interpretability(test_samples[:10])
+        results['interpretability'] = interpretability_results
+
+        self.is_trained = True
+        return results
+
+    def train_codebert(self, train_samples: List[Dict], test_samples: List[Dict]) -> Dict:
+        """Train CodeBERT model with proper setup"""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.codebert_model.to(device)
+        self.codebert_model.train()
+
+        # Training setup - fix the learning rate type issue
+        learning_rate = float(self.config['training']['learning_rate'])
+        weight_decay = float(self.config['training']['weight_decay'])
+
+        optimizer = torch.optim.AdamW(
+            self.codebert_model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+
+        epochs = self.config['training']['num_epochs']
+        batch_size = self.config['training']['batch_size']
+
+        best_loss = float('inf')
+        patience = 3
+        patience_counter = 0
+
+        # Training loop with early stopping
+        for epoch in range(epochs):
+            total_loss = 0
+            num_batches = 0
+
+            for i in range(0, len(train_samples), batch_size):
+                batch = train_samples[i:i + batch_size]
+
+                try:
+                    # Prepare batch
+                    input_ids = torch.cat([s['tokenized']['input_ids'] for s in batch]).to(device)
+                    attention_mask = torch.cat([s['tokenized']['attention_mask'] for s in batch]).to(device)
+                    labels = torch.tensor([s['is_high_quality'] for s in batch], dtype=torch.float).to(device)
+
+                    # Forward pass
+                    outputs = self.codebert_model(input_ids, attention_mask, task='quality')
+                    loss = torch.nn.BCELoss()(outputs['quality_score'].squeeze(), labels)
+
+                    # Backward pass
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item()
+                    num_batches += 1
+
+                except Exception as e:
+                    logger.warning(f"Error in training batch: {e}")
+                    continue
+
+            if num_batches > 0:
+                avg_loss = total_loss / num_batches
+                logger.info(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}")
+
+                # Early stopping logic
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    patience_counter = 0
+                    # Save best model
+                    torch.save(self.codebert_model.state_dict(), self.model_path / "codebert_complete.pth")
+                    logger.info("Saved new best model")
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= patience:
+                    logger.info(f"Early stopping at epoch {epoch + 1}")
+                    break
+
+        # Load best model
+        self.codebert_model.load_state_dict(torch.load(self.model_path / "codebert_complete.pth"))
+        logger.info("Loaded best model weights")
+
+        return {'trained': True, 'model_path': str(self.model_path), 'best_loss': best_loss}
+    def prepare_comprehensive_features(self, commits_data: List[Dict]) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
+        """Combine all feature extraction methods for comprehensive analysis"""
+        logger.info("Extracting comprehensive features using all extractors...")
+
+        all_samples = []
+
+        for commit in tqdm(commits_data, desc="Processing commits"):
+            commit_context = {
+                'files': commit.get('files_changed', []),
+                'hunks': commit.get('hunks', [])
+            }
+
+            for hunk in commit['hunks']:
+                if not any(line.strip() for line in hunk['added_lines']):
+                    continue
+
+                try:
+                    code = '\n'.join(hunk['added_lines'])
+
+                    # Skip empty or whitespace-only code
+                    if not code.strip():
+                        continue
+
+                    # 1. Preprocess code
+                    processed_code = self.preprocessor.preprocess_code(code)
+
+                    # Skip if preprocessing failed
+                    if not processed_code or not processed_code.strip():
+                        continue
+
+                    tokenized = self.preprocessor.tokenize_code(processed_code)
+
+                    # 2. Extract AST features
+                    ast_features = self.ast_extractor.extract_features(code)
+
+                    # 3. Extract graph features
+                    graph_features = self.graph_extractor.extract_features(code)
+
+                    # 4. Extract enhanced features (from previous work)
+                    enhanced_features = extract_enhanced_features(hunk, commit_context)
+
+                    # 5. Generate realistic quality labels
+                    quality_score, is_high_quality, issues = generate_realistic_labels(hunk)
+
+                    # Combine all features
+                    combined_features = {
+                        **ast_features,
+                        **graph_features,
+                        **enhanced_features,
+                        'tokenized_length': len(tokenized['input_ids'][0]),
+                        'has_syntax_errors': 0 if processed_code else 1
+                    }
+
+                    sample = {
+                        'features': combined_features,
+                        'code': code,
+                        'processed_code': processed_code,
+                        'tokenized': tokenized,
+                        'quality_score': quality_score,
+                        'is_high_quality': is_high_quality,
+                        'issues': issues,
+                        'hunk_data': hunk,
+                        'commit_data': commit
+                    }
+
+                    all_samples.append(sample)
+
+                except Exception as e:
+                    logger.warning(f"Error processing hunk: {e}")
+                    continue
+
+        if not all_samples:
+            return np.array([]), np.array([]), []
+
+        # Extract features and labels
+        X = self.baseline_models.prepare_features([s['features'] for s in all_samples])
+        y = np.array([s['is_high_quality'] for s in all_samples])
+
+        logger.info(f"Extracted {len(all_samples)} samples with {X.shape[1]} features")
+        logger.info(f"Quality distribution: {np.mean(y):.1%} high quality")
+
+        return X, y, all_samples
+
+    # def train_all_models(self, commits_data: List[Dict]) -> Dict[str, Any]:
+    #     """Train all models in the system"""
+    #     logger.info("Training complete code review system...")
+    #
+    #     # Generate synthetic data if needed
+    #     if len(commits_data) < 50:
+    #         commits_data = self.generate_synthetic_commits(commits_data, target_size=100)
+    #
+    #     # Prepare comprehensive features
+    #     X, y, samples = self.prepare_comprehensive_features(commits_data)
+    #
+    #     if X.size == 0:
+    #         logger.error("No features extracted. Cannot train models.")
+    #         return {}
+    #
+    #     # Split data
+    #     X_train, X_test, y_train, y_test = train_test_split(
+    #         X, y, test_size=0.2, random_state=42,
+    #         stratify=y if len(np.unique(y)) > 1 else None
+    #     )
+    #
+    #     train_samples = samples[:len(X_train)]
+    #     test_samples = samples[len(X_train):]
+    #
+    #     results = {}
+    #
+    #     # 1. Train baseline models
+    #     logger.info("Training baseline models...")
+    #     baseline_models = self.baseline_models.train_all_models(X_train, y_train)
+    #     results['baseline_models'] = baseline_models
+    #
+    #     # 2. Train CodeBERT model
+    #     logger.info("Training CodeBERT model...")
+    #     codebert_results = self.train_codebert(train_samples, test_samples)
+    #     results['codebert'] = codebert_results
+    #
+    #     # 3. Evaluate all models
+    #     logger.info("Evaluating models...")
+    #     evaluation_results = self.evaluate_models(X_test, y_test, test_samples)
+    #     results['evaluation'] = evaluation_results
+    #
+    #     # 4. Generate interpretability analysis
+    #     logger.info("Generating interpretability analysis...")
+    #     interpretability_results = self.analyze_interpretability(test_samples[:10])
+    #     results['interpretability'] = interpretability_results
+    #
+    #     self.is_trained = True
+    #     return results
+    #
+    # def train_codebert(self, train_samples: List[Dict], test_samples: List[Dict]) -> Dict:
+    #     """Train CodeBERT model with proper setup"""
+    #     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    #     self.codebert_model.to(device)
+    #     self.codebert_model.train()
+    #
+    #     # Training setup - fix the learning rate type issue
+    #     learning_rate = float(self.config['training']['learning_rate'])
+    #     weight_decay = float(self.config['training']['weight_decay'])
+    #
+    #     optimizer = torch.optim.AdamW(
+    #         self.codebert_model.parameters(),
+    #         lr=learning_rate,
+    #         weight_decay=weight_decay
+    #     )
+    #
+    #     epochs = self.config['training']['num_epochs']
+    #     batch_size = self.config['training']['batch_size']
+    #
+    #     # Training loop
+    #     for epoch in range(epochs):
+    #         total_loss = 0
+    #         num_batches = 0
+    #
+    #         for i in range(0, len(train_samples), batch_size):
+    #             batch = train_samples[i:i + batch_size]
+    #
+    #             try:
+    #                 # Prepare batch
+    #                 input_ids = torch.cat([s['tokenized']['input_ids'] for s in batch]).to(device)
+    #                 attention_mask = torch.cat([s['tokenized']['attention_mask'] for s in batch]).to(device)
+    #                 labels = torch.tensor([s['is_high_quality'] for s in batch], dtype=torch.float).to(device)
+    #
+    #                 # Forward pass
+    #                 outputs = self.codebert_model(input_ids, attention_mask, task='quality')
+    #                 loss = torch.nn.BCELoss()(outputs['quality_score'].squeeze(), labels)
+    #
+    #                 # Backward pass
+    #                 optimizer.zero_grad()
+    #                 loss.backward()
+    #                 optimizer.step()
+    #
+    #                 total_loss += loss.item()
+    #                 num_batches += 1
+    #
+    #             except Exception as e:
+    #                 logger.warning(f"Error in training batch: {e}")
+    #                 continue
+    #
+    #         if num_batches > 0:
+    #             avg_loss = total_loss / num_batches
+    #             logger.info(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}")
+    #
+    #     # Save model
+    #     model_path = Path("models/codebert")
+    #     model_path.mkdir(parents=True, exist_ok=True)
+    #     torch.save(self.codebert_model.state_dict(), model_path / "codebert_complete.pth")
+    #
+    #     return {'trained': True, 'model_path': str(model_path)}
+
+    def evaluate_models(self, X_test: np.ndarray, y_test: np.ndarray, test_samples: List[Dict]) -> Dict:
+        """Evaluate all models comprehensively"""
+        results = {}
+
+        # Evaluate baseline models
+        for model_name, model in self.baseline_models.trained_models.items():
+            try:
+                y_pred, y_prob = self.baseline_models.predict(model_name, X_test)
+                metrics = self.evaluator.evaluate_classification(y_test, y_pred, y_prob)
+                results[f'baseline_{model_name}'] = metrics
+                logger.info(f"{model_name}: F1={metrics['f1']:.3f}, AUC={metrics.get('auc', 0):.3f}")
+            except Exception as e:
+                logger.warning(f"Error evaluating {model_name}: {e}")
+
+        # Evaluate CodeBERT
+        try:
+            codebert_predictions = self.evaluate_codebert(test_samples)
+            results['codebert'] = codebert_predictions
+        except Exception as e:
+            logger.warning(f"Error evaluating CodeBERT: {e}")
+
+        return results
+
+    def evaluate_codebert(self, test_samples: List[Dict]) -> Dict:
+        """Evaluate CodeBERT model"""
+        self.codebert_model.eval()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        predictions = []
+        true_labels = []
+
+        with torch.no_grad():
+            for sample in test_samples[:20]:  # Limit for memory
+                try:
+                    input_ids = sample['tokenized']['input_ids'].to(device)
+                    attention_mask = sample['tokenized']['attention_mask'].to(device)
+
+                    outputs = self.codebert_model(input_ids, attention_mask, task='quality')
+                    pred = outputs['quality_score'].cpu().numpy().flatten()[0]
+
+                    predictions.append(pred)
+                    true_labels.append(sample['is_high_quality'])
+
+                except Exception as e:
+                    logger.warning(f"Error evaluating sample: {e}")
+                    continue
+
+        if predictions:
+            y_pred_binary = [1 if p > 0.5 else 0 for p in predictions]
+            metrics = self.evaluator.evaluate_classification(
+                np.array(true_labels),
+                np.array(y_pred_binary),
+                np.array(predictions)
+            )
+            return metrics
+
+        return {'error': 'No predictions generated'}
+
+    def analyze_interpretability(self, samples: List[Dict]) -> Dict:
+        """Generate interpretability analysis for sample predictions"""
+        interpretability_results = {}
+
+        for i, sample in enumerate(samples):
+            try:
+                # Get model predictions
+                X_sample = self.baseline_models.prepare_features([sample['features']])
+
+                # Analyze feature importance for this sample
+                if 'random_forest' in self.baseline_models.trained_models:
+                    rf_model = self.baseline_models.trained_models['random_forest']
+                    feature_importance = self.interpretability.generate_feature_importance(rf_model, X_sample, list(
+                        sample['features'].keys()))
+
+                    # Get top features
+                    if feature_importance:
+                        top_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
+                    else:
+                        top_features = []
+
+                    interpretability_results[f'sample_{i}'] = {
+                        'code_snippet': sample['code'][:200] + '...' if len(sample['code']) > 200 else sample['code'],
+                        'predicted_quality': sample['is_high_quality'],
+                        'quality_score': sample['quality_score'],
+                        'key_issues': sample['issues'],
+                        'top_features': top_features
+                    }
+
+            except Exception as e:
+                logger.warning(f"Error analyzing sample {i}: {e}")
+                continue
+
+        return interpretability_results
+
+    def generate_review_comments(self, code: str, hunk_data: Dict = None) -> List[str]:
+        """
+        Generate automated review comments for given code
+        This is the core automated review functionality
+        """
+        if not self.is_trained:
+            return ["Error: System not trained yet"]
+
+        try:
+            # 1. Preprocess and analyze code
+            processed_code = self.preprocessor.preprocess_code(code)
+            tokenized = self.preprocessor.tokenize_code(processed_code)
+
+            # 2. Extract features
+            ast_features = self.ast_extractor.extract_features(code)
+            graph_features = self.graph_extractor.extract_features(code)
+
+            if hunk_data:
+                enhanced_features = extract_enhanced_features(hunk_data, {})
+            else:
+                enhanced_features = {}
+
+            # Combine features
+            combined_features = {**ast_features, **graph_features, **enhanced_features}
+            X = self.baseline_models.prepare_features([combined_features])
+
+            # 3. Generate predictions from multiple models
+            comments = []
+
+            # Baseline model predictions
+            for model_name, model in self.baseline_models.trained_models.items():
+                try:
+                    y_pred, y_prob = self.baseline_models.predict(model_name, X)
+                    confidence = y_prob[0] if len(y_prob) > 0 else 0
+
+                    if y_pred[0] == 0 and confidence > 0.7:  # Low quality with high confidence
+                        comments.append(
+                            f"⚠️ {model_name.title()} model flags this code as potentially problematic (confidence: {confidence:.2f})")
+                except Exception as e:
+                    continue
+
+            # CodeBERT prediction
+            try:
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                self.codebert_model.eval()
+
+                with torch.no_grad():
+                    input_ids = tokenized['input_ids'].to(device)
+                    attention_mask = tokenized['attention_mask'].to(device)
+
+                    outputs = self.codebert_model(input_ids, attention_mask, task='quality')
+                    codebert_score = outputs['quality_score'].cpu().numpy().flatten()[0]
+
+                    if codebert_score < 0.6:
+                        comments.append(
+                            f"🤖 CodeBERT analysis suggests code quality concerns (score: {codebert_score:.2f})")
+                    elif codebert_score > 0.8:
+                        comments.append(
+                            f"✅ CodeBERT analysis indicates good code quality (score: {codebert_score:.2f})")
+
+            except Exception as e:
+                logger.warning(f"CodeBERT prediction failed: {e}")
+
+            # 4. Generate specific issue-based comments
+            if hunk_data:
+                _, _, issues = generate_realistic_labels(hunk_data)
+
+                issue_messages = {
+                    'very_long_change': "📏 Consider breaking this large change into smaller, more focused commits",
+                    'no_comments': "📝 Adding comments would improve code readability and maintainability",
+                    'debug_prints': "🐛 Remove debug print statements before committing",
+                    'long_lines': "📐 Some lines exceed recommended length. Consider breaking them up",
+                    'deep_nesting': "🔄 Deep nesting detected. Consider refactoring to reduce complexity",
+                    'unparseable_syntax': "❌ Syntax errors detected. Please review the code",
+                    'todo_markers': "📋 TODO/FIXME comments found. Consider addressing them"
+                }
+
+                for issue in issues:
+                    if issue in issue_messages:
+                        comments.append(issue_messages[issue])
+
+            # 5. Generate suggestions using AST analysis
+            if ast_features.get('cyclomatic_complexity', 0) > 10:
+                comments.append("🔧 High cyclomatic complexity detected. Consider refactoring into smaller functions")
+
+            if ast_features.get('num_functions', 0) > 5:
+                comments.append("🏗️ Multiple functions in one change. Consider separating concerns")
+
+            # 6. Default positive feedback if no issues
+            if not comments:
+                comments.append("✅ Code looks good! No significant issues detected")
+
+            return comments
+
+        except Exception as e:
+            logger.error(f"Error generating review comments: {e}")
+            return ["Error generating automated review"]
+
+    def generate_synthetic_commits(self, commits_data: List[Dict], target_size: int = 100) -> List[Dict]:
+        """Generate synthetic commits for training"""
+        logger.info(f"Generating synthetic commits to reach {target_size} total")
+
+        synthetic_templates = [
+            # High quality examples
+            ("high", """def process_user_data(user_input: dict) -> dict:
+    \"\"\"
+    Process and validate user input data.
+
+    Args:
+        user_input: Dictionary containing user data
+
+    Returns:
+        Processed user data dictionary
+
+    Raises:
+        ValueError: If input data is invalid
+    \"\"\"
+    if not isinstance(user_input, dict):
+        raise ValueError("Input must be a dictionary")
+
+    processed_data = {}
+
+    # Validate required fields
+    required_fields = ['name', 'email']
+    for field in required_fields:
+        if field not in user_input:
+            raise ValueError(f"Missing required field: {field}")
+        processed_data[field] = str(user_input[field]).strip()
+
+    # Optional fields with defaults
+    processed_data['age'] = int(user_input.get('age', 0))
+    processed_data['active'] = bool(user_input.get('active', True))
+
+    return processed_data"""),
+
+            # Low quality examples
+            ("low", """def func(x):
+    print(x)
+    if x>10:
+        print("big")
+        return x*2
+    else:
+        print("small")
+        return x*3"""),
+
+            ("low", """global_var = []
+
+def add_stuff(thing):
+    global global_var
+    global_var.append(thing)
+    print(global_var)
+    return len(global_var)"""),
+        ]
+
+        synthetic_commits = list(commits_data)
+
+        while len(synthetic_commits) < target_size:
+            for quality, code in synthetic_templates:
+                if len(synthetic_commits) >= target_size:
+                    break
+
+                # Add variations
+                varied_code = code.replace('user', f'user_{len(synthetic_commits)}')
+
+                synthetic_hunk = {
+                    'added_lines': varied_code.split('\n'),
+                    'removed_lines': [],
+                    'context_lines': ['# Context', ''],
+                    'line_start': 1,
+                    'line_end': len(varied_code.split('\n'))
+                }
+
+                synthetic_commit = {
+                    'id': f'synthetic_{len(synthetic_commits)}',
+                    'message': f'Synthetic {quality} quality commit',
+                    'author': 'synthetic_generator',
+                    'files_changed': ['synthetic_file.py'],
+                    'hunks': [synthetic_hunk]
+                }
+
+                synthetic_commits.append(synthetic_commit)
+
+        return synthetic_commits
+
+
+def run_automated_review(system: CompleteCodeReviewSystem, repo_path: str, target_files: List[str] = None):
+    """
+    Run automated review on specific files or recent changes
+    This demonstrates the main automated review workflow
+    """
+    logger.info("Running automated code review...")
+
+    git_integration = GitIntegration(repo_path)
+
+    # Get recent changes or specified files
+    if target_files:
+        # Review specific files
+        for file_path in target_files:
+            logger.info(f"Reviewing file: {file_path}")
+            try:
+                with open(Path(repo_path) / file_path, 'r') as f:
+                    code = f.read()
+
+                comments = system.generate_review_comments(code)
+
+                print(f"\n{'=' * 50}")
+                print(f"AUTOMATED REVIEW: {file_path}")
+                print('=' * 50)
+                for i, comment in enumerate(comments, 1):
+                    print(f"{i}. {comment}")
+                print()
+
+            except Exception as e:
+                logger.error(f"Error reviewing {file_path}: {e}")
+    else:
+        # Review recent changes (staged or recent commits)
+        diff = git_integration.get_staged_diff()
+        if diff:
+            logger.info("Reviewing staged changes...")
+
+            # Parse diff into structured data
+            parsed_files = git_integration.diff_parser.parse_diff(diff)
+
+            if not parsed_files:
+                print("\n📝 No parseable changes found in staged diff.")
+                return
+
+            print(f"\n🔍 AUTOMATED REVIEW OF STAGED CHANGES")
+            print(f"Found {len(parsed_files)} files with changes")
+            print("=" * 60)
+
+            for file_data in parsed_files:
+                file_path = file_data['file_path']
+                print(f"\n📁 FILE: {file_path}")
+                print("-" * 50)
+
+                for i, hunk in enumerate(file_data['hunks']):
+                    if not hunk['added_lines']:
+                        continue
+
+                    print(f"\n🔄 Hunk {i + 1} (lines {hunk['line_start']}-{hunk['line_end']}):")
+
+                    # Show the added code
+                    added_code = '\n'.join(hunk['added_lines'])
+                    if added_code.strip():
+                        print("Added code:")
+                        for j, line in enumerate(hunk['added_lines'][:5]):  # Show first 5 lines
+                            print(f"  + {line}")
+
+                        if len(hunk['added_lines']) > 5:
+                            print(f"    ... and {len(hunk['added_lines']) - 5} more lines")
+
+                    # Generate review comments for this hunk
+                    try:
+                        comments = system.generate_review_comments(added_code, hunk)
+
+                        print("\n💬 Review Comments:")
+                        for j, comment in enumerate(comments, 1):
+                            print(f"  {j}. {comment}")
+
+                    except Exception as e:
+                        logger.error(f"Error reviewing hunk: {e}")
+                        print(f"  ❌ Error analyzing this hunk: {e}")
+
+                    print()
+        else:
+            print("\n📝 No staged changes found. Please stage changes or specify files to review.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Complete Automated Code Review System")
+    parser.add_argument('--config', default='configs/config.yaml', help='Config file path')
+    parser.add_argument('--repo-path', required=True, help='Path to git repository')
+    parser.add_argument('--task', choices=['train', 'review', 'both'], default='both')
+    parser.add_argument('--files', nargs='*', help='Specific files to review')
+    parser.add_argument('--visualize', action='store_true', help='Create visualizations')
+    parser.add_argument('--force-retrain',default=False, action='store_true', help='Force retraining even if models exist')
+    args = parser.parse_args()
+
+    # Setup
+    logger = setup_logging()
+    config = load_config(args.config)
+
+    # Initialize system
+    system = CompleteCodeReviewSystem(config)
+
+    if args.task in ['train', 'both']:
+        # Load training data
+        data_loader = CodeReviewDataLoader(args.repo_path)
+        commits_data = data_loader.extract_commits(limit=config.get('data_limit', 500))
+        force_retrain = args.force_retrain
+        if not commits_data:
+            logger.error("No commit data found for training")
+            return
+
+        # Train the system
+
+        training_results = system.train_all_models(commits_data, force_retrain=force_retrain)
+
+        # Save results
+        results_path = Path("results")
+        results_path.mkdir(exist_ok=True)
+
+        with open(results_path / "complete_training_results.json", 'w') as f:
+            json.dump(training_results, f, indent=2, default=str)
+
+        logger.info("Training completed successfully")
+
+        # Create visualizations
+        if args.visualize:
+            logger.info("Creating visualizations...")
+            # Visualization code would go here
+
+    if args.task in ['review', 'both']:
+        if not system.is_trained and args.task == 'review':
+            logger.error("System not trained. Please train first or use --task both")
+            return
+
+        # Run automated review
+        run_automated_review(system, args.repo_path, args.files)
+
+    logger.info("Complete code review system finished")
+
 
 def load_config(config_path: str = "configs/config.yaml") -> Dict[str, Any]:
     """Load configuration file"""
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
-
-
-def prepare_baseline_features(commits_data: List[Dict]) -> tuple:
-    """Prepare features for baseline models"""
-    ast_extractor = ASTFeatureExtractor()
-    graph_extractor = GraphFeatureExtractor()
-    preprocessor = CodePreprocessor()
-
-    all_features = []
-    all_labels = []
-
-    logger.info("Extracting features for baseline models...")
-
-    for commit in tqdm(commits_data):
-        for hunk in commit['hunks']:
-            # Combine added and removed lines
-            code = '\n'.join(hunk['added_lines'] + hunk['context_lines'])
-
-            if not code.strip():
-                continue
-
-            # Extract features
-            ast_features = ast_extractor.extract_ast_features(code)
-            graph = graph_extractor.create_dependency_graph(code)
-            graph_features = graph_extractor.extract_graph_features(graph)
-            code_metrics = preprocessor.extract_code_metrics(code)
-
-            # Combine all features
-            combined_features = {
-                **ast_features,
-                **graph_features,
-                **code_metrics
-            }
-
-            all_features.append(combined_features)
-
-            # Generate synthetic labels (in real scenario, use actual review data)
-            quality_score = min(1.0, len(hunk['added_lines']) / 10.0)  # Simple heuristic
-            all_labels.append(quality_score > 0.5)
-
-    return all_features, all_labels
-
-
-def train_baseline_models(config: Dict, commits_data: List[Dict]) -> Dict:
-    """Train baseline models"""
-    logger.info("Training baseline models...")
-
-    # Prepare features
-    feature_dicts, labels = prepare_baseline_features(commits_data)
-
-    # Convert to numpy arrays
-    baseline_models = BaselineModels()
-    X = baseline_models.prepare_features(feature_dicts)
-    y = np.array(labels)
-
-    # Train models
-    trained_models = baseline_models.train_all_models(X, y)
-
-    # Save models
-    models_path = Path("models/baselines")
-    models_path.mkdir(parents=True, exist_ok=True)
-    baseline_models.save_models(str(models_path))
-
-    return trained_models
-
-
-def train_codebert_model(config: Dict, commits_data: List[Dict]) -> CodeBERTMultiTask:
-    """Train CodeBERT multi-task model"""
-    logger.info("Training CodeBERT model...")
-
-    # Initialize model and preprocessor
-    model = CodeBERTMultiTask(
-        model_name=config['model']['name'],
-        dropout_rate=config['model'].get('dropout', 0.1)
-    )
-
-    preprocessor = CodePreprocessor(config['model']['name'])
-
-    # Prepare training data
-    train_data = []
-    for commit in commits_data:
-        for hunk in commit['hunks']:
-            code = '\n'.join(hunk['added_lines'] + hunk['context_lines'])
-            if code.strip():
-                tokenized = preprocessor.tokenize_code(code)
-                train_data.append({
-                    'input_ids': tokenized['input_ids'],
-                    'attention_mask': tokenized['attention_mask'],
-                    'quality_label': len(hunk['added_lines']) > 5  # Simple heuristic
-                })
-
-    # Training loop (simplified)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.train()
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config['training']['learning_rate'],
-        weight_decay=config['training']['weight_decay']
-    )
-
-    # Simple training loop
-    for epoch in range(config['training']['num_epochs']):
-        total_loss = 0
-        for i in range(0, len(train_data), config['training']['batch_size']):
-            batch = train_data[i:i + config['training']['batch_size']]
-
-            # Prepare batch tensors
-            input_ids = torch.cat([item['input_ids'] for item in batch]).to(device)
-            attention_mask = torch.cat([item['attention_mask'] for item in batch]).to(device)
-            labels = torch.tensor([item['quality_label'] for item in batch], dtype=torch.float).to(device)
-
-            # Forward pass
-            outputs = model(input_ids, attention_mask, task='quality')
-
-            # Compute loss
-            loss = torch.nn.BCELoss()(outputs['quality_score'].squeeze(), labels)
-
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        logger.info(f"Epoch {epoch + 1}/{config['training']['num_epochs']}, Loss: {total_loss / len(train_data):.4f}")
-
-    # Save model
-    model_path = Path("models/codebert")
-    model_path.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), model_path / "codebert_multitask.pth")
-
-    return model
-
-
-def evaluate_models(config: Dict, models: Dict, test_data: List[Dict]) -> Dict:
-    """Evaluate all trained models"""
-    logger.info("Evaluating models...")
-
-    evaluator = ModelEvaluator()
-    results = {}
-
-    # Evaluate baseline models
-    for model_name, model in models.get('baselines', {}).items():
-        # Prepare test features (simplified)
-        y_true = np.random.randint(0, 2, 100)  # Dummy test data
-        y_pred = np.random.randint(0, 2, 100)
-        y_prob = np.random.random(100)
-
-        results[model_name] = evaluator.evaluate_classification(y_true, y_pred, y_prob)
-
-    return results
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Automated Code Review System")
-    parser.add_argument('--config', default='configs/config.yaml', help='Config file path')
-    parser.add_argument('--repo-path', required=True, help='Path to git repository')
-    parser.add_argument('--task', choices=['baselines', 'codebert', 'all'], default='all')
-    parser.add_argument('--evaluate', action='store_true', help='Run evaluation')
-    parser.add_argument('--hook-mode', action='store_true', help='Run in pre-commit hook mode')
-
-    args = parser.parse_args()
-
-    # Setup logging
-    logger = setup_logging()
-
-    # Load configuration
-    config = load_config(args.config)
-
-    # Initialize components
-    data_loader = CodeReviewDataLoader(args.repo_path)
-    git_integration = GitIntegration(args.repo_path)
-
-    if args.hook_mode:
-        # Pre-commit hook mode
-        logger.info("Running in pre-commit hook mode")
-        diff = git_integration.get_staged_diff()
-        if diff:
-            # Analyze staged changes (simplified)
-            logger.info("Analyzing staged changes...")
-            # Implementation would analyze diff and provide feedback
-        return
-
-    # Load data
-    logger.info("Loading commit data...")
-    commits_data = data_loader.extract_commits(limit=config.get('data_limit', 1000))
-
-    if not commits_data:
-        logger.error("No commit data found. Exiting.")
-        return
-
-    trained_models = {}
-
-    # Train models based on task
-    if args.task in ['baselines', 'all']:
-        trained_models['baselines'] = train_baseline_models(config, commits_data)
-
-    if args.task in ['codebert', 'all']:
-        trained_models['codebert'] = train_codebert_model(config, commits_data)
-
-    # Evaluation
-    if args.evaluate:
-        results = evaluate_models(config, trained_models, commits_data)
-
-        # Save results
-        results_path = Path("results")
-        results_path.mkdir(exist_ok=True)
-
-        with open(results_path / "evaluation_results.json", 'w') as f:
-            json.dump(results, f, indent=2)
-
-        logger.info("Evaluation completed. Results saved to results/evaluation_results.json")
-
-    # Generate interpretability analysis
-    if config.get('evaluation', {}).get('generate_explanations', False):
-        analyzer = InterpretabilityAnalyzer()
-
-        # SHAP analysis for baseline models (simplified)
-        logger.info("Generating interpretability analysis...")
-        # Implementation would generate SHAP values and attention visualizations
-
-    logger.info("Training completed successfully!")
 
 
 if __name__ == "__main__":
