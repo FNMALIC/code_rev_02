@@ -15,6 +15,10 @@ data:
   val_split: 0.1
   test_split: 0.1
 
+external_ai:
+  api_key: "AIzaSyBOUCDxmn1o_7qCydXFyuv8gkpn4XOYRCM"
+  model: "gpt-3.5-turbo"
+
 evaluation:
   metrics: ["accuracy", "f1", "precision", "recall", "auc"]
   generate_explanations: true

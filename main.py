@@ -12,7 +12,9 @@ import logging
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.utils import resample
-
+import re
+from src.integration.diff_parser import EnhancedGitDiffParser
+from src.utils.ExternalAIReviewer import ExternalAIReviewer
 from src.utils.logging_config import setup_logging
 from src.data.loader import CodeReviewDataLoader
 from src.data.preprocessor import CodePreprocessor
@@ -30,6 +32,52 @@ from src.features.enhanced_labeling import (
     preprocess_code_fragment,
     analyze_label_distribution
 )
+
+
+import json
+import re
+
+ICONS = {
+    "assessment": "📝",
+    "issues": "⚠️",
+    "recommendations": "💡",
+    "security": "🔒",
+    "performance": "⚡",
+    "analysis": "🤖"
+}
+
+def pretty_print_external_analysis(ext: dict):
+    print("\nExternal AI Insights:")
+
+    for key, value in ext.items():
+        if not value or key == "error":
+            continue
+
+        title = key.title()
+        icon = ICONS.get(key.lower(), "🔹")
+        print(f"\n{icon} {title}:")
+
+        # If it's a list, print as bullet points
+        if isinstance(value, list):
+            for item in value:
+                print(f"   • {item}")
+
+        # If it's a dict, pretty print subkeys
+        elif isinstance(value, dict):
+            for subk, subv in value.items():
+                print(f"   {subk.title()}: {subv}")
+
+        # If it's a JSON string with ```json ... ```
+        elif isinstance(value, str) and value.strip().startswith("```json"):
+            cleaned = re.sub(r"^```json|```$", "", value.strip(), flags=re.MULTILINE).strip()
+            try:
+                parsed = json.loads(cleaned)
+                pretty_print_external_analysis(parsed)  # recursive formatting
+            except:
+                print(f"   {value}")
+        else:
+            print(f"   {value}")
+
 
 logger = logging.getLogger(__name__)
 
@@ -706,89 +754,278 @@ def add_stuff(thing):
         return synthetic_commits
 
 
-def run_automated_review(system: CompleteCodeReviewSystem, repo_path: str, target_files: List[str] = None):
-    """
-    Run automated review on specific files or recent changes
-    This demonstrates the main automated review workflow
-    """
-    logger.info("Running automated code review...")
+class ImprovedCodeReviewSystem(CompleteCodeReviewSystem):
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+
+        # Initialize external AI reviewer
+        api_key = config.get('external_ai', {}).get('api_key')
+        # model = config.get('external_ai', {}).get('model', 'gpt-3.5-turbo')
+        self.external_ai = ExternalAIReviewer(api_key)
+
+        # Enhanced diff parser
+        self.diff_parser = EnhancedGitDiffParser()
+
+    def generate_comprehensive_review(self, hunk: Dict, file_path: str, show_all_lines: bool = True) -> Dict:
+        """Generate comprehensive review using multiple analysis methods"""
+
+        added_code = '\n'.join(hunk['added_lines']) if hunk['added_lines'] else ""
+        removed_code = '\n'.join(hunk['removed_lines']) if hunk['removed_lines'] else ""
+        context = '\n'.join(hunk['context_lines']) if hunk['context_lines'] else ""
+
+        review_results = {
+            'local_analysis': {},
+            'external_analysis': {},
+            'combined_feedback': []
+        }
+
+        # 1. Local model analysis (existing CodeBERT + baselines)
+        if added_code.strip():
+            local_comments = self.generate_review_comments(added_code, hunk)
+            review_results['local_analysis'] = {
+                'comments': local_comments,
+                'code_lines_analyzed': len(hunk['added_lines']),
+                'total_lines_available': len(hunk['added_lines'])
+            }
+
+        # 2. External AI analysis
+        if self.external_ai.api_key and (added_code.strip() or removed_code.strip()):
+            external_analysis = self.external_ai.analyze_code_change(
+                added_code, removed_code, context, file_path
+            )
+            review_results['external_analysis'] = external_analysis
+
+        # 3. Combined analysis
+        combined_feedback = self._combine_analysis_results(
+            review_results['local_analysis'],
+            review_results['external_analysis'],
+            added_code,
+            removed_code,
+            hunk
+        )
+        review_results['combined_feedback'] = combined_feedback
+
+        return review_results
+
+    def _combine_analysis_results(self, local: Dict, external: Dict, added: str, removed: str, hunk: Dict) -> List[str]:
+        """Combine local and external analysis into actionable feedback"""
+        feedback = []
+
+        # Change type analysis
+        if removed and added:
+            feedback.append(f"Modified {len(removed.split())} -> {len(added.split())} lines")
+        elif added and not removed:
+            feedback.append(f"Added {len(added.splitlines())} new lines")
+        elif removed and not added:
+            feedback.append(f"Removed {len(removed.splitlines())} lines")
+
+        # Local analysis feedback
+        if local.get('comments'):
+            feedback.extend(local['comments'])
+
+        # External AI feedback
+        if external and 'error' not in external:
+            if external.get('assessment'):
+                feedback.append(f"AI Assessment: {external['assessment']}")
+
+            if external.get('issues'):
+                feedback.append(f"Potential Issues: {external['issues']}")
+
+            if external.get('recommendations'):
+                feedback.append(f"Recommendations: {external['recommendations']}")
+
+            if external.get('security'):
+                feedback.append(f"Security: {external['security']}")
+
+            if external.get('performance'):
+                feedback.append(f"Performance: {external['performance']}")
+
+        # Complexity analysis
+        if added:
+            lines = added.splitlines()
+            if len(lines) > 20:
+                feedback.append("Large change detected - consider breaking into smaller commits")
+
+            # Check for specific patterns
+            if 'TODO' in added or 'FIXME' in added:
+                feedback.append("Contains TODO/FIXME - ensure these are addressed")
+
+            if 'print(' in added or 'console.log' in added:
+                feedback.append("Debug statements detected - remove before production")
+
+        return feedback if feedback else ["No specific issues detected"]
+
+# def run_automated_review(system: CompleteCodeReviewSystem, repo_path: str, target_files: List[str] = None):
+#     """
+#     Run automated review on specific files or recent changes
+#     This demonstrates the main automated review workflow
+#     """
+#     logger.info("Running automated code review...")
+#
+#     git_integration = GitIntegration(repo_path)
+#
+#     # Get recent changes or specified files
+#     if target_files:
+#         # Review specific files
+#         for file_path in target_files:
+#             logger.info(f"Reviewing file: {file_path}")
+#             try:
+#                 with open(Path(repo_path) / file_path, 'r') as f:
+#                     code = f.read()
+#
+#                 comments = system.generate_review_comments(code)
+#
+#                 print(f"\n{'=' * 50}")
+#                 print(f"AUTOMATED REVIEW: {file_path}")
+#                 print('=' * 50)
+#                 for i, comment in enumerate(comments, 1):
+#                     print(f"{i}. {comment}")
+#                 print()
+#
+#             except Exception as e:
+#                 logger.error(f"Error reviewing {file_path}: {e}")
+#     else:
+#         # Review recent changes (staged or recent commits)
+#         diff = git_integration.get_staged_diff()
+#         if diff:
+#             logger.info("Reviewing staged changes...")
+#
+#             # Parse diff into structured data
+#             parsed_files = git_integration.diff_parser.parse_diff(diff)
+#
+#             if not parsed_files:
+#                 print("\n📝 No parseable changes found in staged diff.")
+#                 return
+#
+#             print(f"\n🔍 AUTOMATED REVIEW OF STAGED CHANGES")
+#             print(f"Found {len(parsed_files)} files with changes")
+#             print("=" * 60)
+#
+#             for file_data in parsed_files:
+#                 file_path = file_data['file_path']
+#                 print(f"\n📁 FILE: {file_path}")
+#                 print("-" * 50)
+#
+#                 for i, hunk in enumerate(file_data['hunks']):
+#                     if not hunk['added_lines']:
+#                         continue
+#
+#                     print(f"\n🔄 Hunk {i + 1} (lines {hunk['line_start']}-{hunk['line_end']}):")
+#
+#                     # Show the added code
+#                     added_code = '\n'.join(hunk['added_lines'])
+#                     if added_code.strip():
+#                         print("Added code:")
+#                         for j, line in enumerate(hunk['added_lines'][:5]):  # Show first 5 lines
+#                             print(f"  + {line}")
+#
+#                         if len(hunk['added_lines']) > 5:
+#                             print(f"    ... and {len(hunk['added_lines']) - 5} more lines")
+#
+#                     # Generate review comments for this hunk
+#                     try:
+#                         comments = system.generate_review_comments(added_code, hunk)
+#
+#                         print("\n💬 Review Comments:")
+#                         for j, comment in enumerate(comments, 1):
+#                             print(f"  {j}. {comment}")
+#
+#                     except Exception as e:
+#                         logger.error(f"Error reviewing hunk: {e}")
+#                         print(f"  ❌ Error analyzing this hunk: {e}")
+#
+#                     print()
+#         else:
+#             print("\n📝 No staged changes found. Please stage changes or specify files to review.")
+
+
+def run_automated_review_enhanced(system: ImprovedCodeReviewSystem, repo_path: str, target_files: List[str] = None):
+    """Enhanced automated review with comprehensive analysis"""
+    logger.info("Running enhanced automated code review...")
 
     git_integration = GitIntegration(repo_path)
+    git_integration.diff_parser = system.diff_parser  # Use enhanced parser
 
-    # Get recent changes or specified files
     if target_files:
-        # Review specific files
+        # Review specific files (existing logic)
         for file_path in target_files:
             logger.info(f"Reviewing file: {file_path}")
             try:
                 with open(Path(repo_path) / file_path, 'r') as f:
                     code = f.read()
 
-                comments = system.generate_review_comments(code)
+                print(f"\n{'=' * 60}")
+                print(f"COMPREHENSIVE REVIEW: {file_path}")
+                print('=' * 60)
 
-                print(f"\n{'=' * 50}")
-                print(f"AUTOMATED REVIEW: {file_path}")
-                print('=' * 50)
-                for i, comment in enumerate(comments, 1):
+                # Create mock hunk for full file analysis
+                mock_hunk = {
+                    'added_lines': code.splitlines(),
+                    'removed_lines': [],
+                    'context_lines': [],
+                    'line_start': 1,
+                    'line_end': len(code.splitlines())
+                }
+
+                review = system.generate_comprehensive_review(mock_hunk, file_path)
+
+                # Display results
+                for i, comment in enumerate(review['combined_feedback'], 1):
                     print(f"{i}. {comment}")
-                print()
 
             except Exception as e:
                 logger.error(f"Error reviewing {file_path}: {e}")
+
     else:
-        # Review recent changes (staged or recent commits)
+        # Review staged changes
         diff = git_integration.get_staged_diff()
         if diff:
-            logger.info("Reviewing staged changes...")
-
-            # Parse diff into structured data
             parsed_files = git_integration.diff_parser.parse_diff(diff)
 
             if not parsed_files:
-                print("\n📝 No parseable changes found in staged diff.")
+                print("\nNo parseable changes found.")
                 return
 
-            print(f"\n🔍 AUTOMATED REVIEW OF STAGED CHANGES")
-            print(f"Found {len(parsed_files)} files with changes")
-            print("=" * 60)
+            print(f"\nCOMPREHENSIVE REVIEW OF STAGED CHANGES")
+            print(f"Analyzing {len(parsed_files)} files")
+            print("=" * 70)
 
             for file_data in parsed_files:
                 file_path = file_data['file_path']
-                print(f"\n📁 FILE: {file_path}")
+                print(f"\nFILE: {file_path}")
                 print("-" * 50)
 
+                if not file_data['hunks']:
+                    print("No processable hunks found in this file")
+                    continue
+
                 for i, hunk in enumerate(file_data['hunks']):
-                    if not hunk['added_lines']:
-                        continue
+                    print(f"\nHunk {i + 1} (lines {hunk.get('line_start', '?')}-{hunk.get('line_end', '?')}):")
 
-                    print(f"\n🔄 Hunk {i + 1} (lines {hunk['line_start']}-{hunk['line_end']}):")
-
-                    # Show the added code
-                    added_code = '\n'.join(hunk['added_lines'])
-                    if added_code.strip():
-                        print("Added code:")
-                        for j, line in enumerate(hunk['added_lines'][:5]):  # Show first 5 lines
+                    # Show ALL changes, not just first 5
+                    if hunk['added_lines']:
+                        print("Added:")
+                        for line in hunk['added_lines']:
                             print(f"  + {line}")
 
-                        if len(hunk['added_lines']) > 5:
-                            print(f"    ... and {len(hunk['added_lines']) - 5} more lines")
+                    if hunk['removed_lines']:
+                        print("Removed:")
+                        for line in hunk['removed_lines']:
+                            print(f"  - {line}")
 
-                    # Generate review comments for this hunk
-                    try:
-                        comments = system.generate_review_comments(added_code, hunk)
+                    # Generate comprehensive review
+                    review = system.generate_comprehensive_review(hunk, file_path)
 
-                        print("\n💬 Review Comments:")
-                        for j, comment in enumerate(comments, 1):
-                            print(f"  {j}. {comment}")
+                    print("\nComprehensive Analysis:")
+                    for j, feedback in enumerate(review['combined_feedback'], 1):
+                        print(f"  {j}. {feedback}")
 
-                    except Exception as e:
-                        logger.error(f"Error reviewing hunk: {e}")
-                        print(f"  ❌ Error analyzing this hunk: {e}")
-
+                    # Show external AI analysis separately if available
+                    if review['external_analysis'] and 'error' not in review['external_analysis']:
+                        pretty_print_external_analysis(review['external_analysis'])
                     print()
         else:
-            print("\n📝 No staged changes found. Please stage changes or specify files to review.")
-
+            print("\nNo staged changes found.")
 def main():
     parser = argparse.ArgumentParser(description="Complete Automated Code Review System")
     parser.add_argument('--config', default='configs/config.yaml', help='Config file path')
@@ -804,7 +1041,9 @@ def main():
     config = load_config(args.config)
 
     # Initialize system
-    system = CompleteCodeReviewSystem(config)
+    # system = CompleteCodeReviewSystem(config)
+
+    system = ImprovedCodeReviewSystem(config)
 
     if args.task in ['train', 'both']:
         # Load training data
@@ -839,7 +1078,7 @@ def main():
             return
 
         # Run automated review
-        run_automated_review(system, args.repo_path, args.files)
+        run_automated_review_enhanced(system, args.repo_path, args.files)
 
     logger.info("Complete code review system finished")
 

@@ -77,4 +77,26 @@ class GitDiffParser:
         if current_file:
             files.append(current_file)
 
+
+        return files
+
+
+class EnhancedGitDiffParser(GitDiffParser):
+    def parse_diff(self, diff_output: str) -> List[Dict]:
+        files = super().parse_diff(diff_output)
+
+        # Process files that had no hunks but have changes
+        for file_data in files:
+            if not file_data['hunks']:
+                # Check if it's a new file or has binary changes
+                if 'new file mode' in diff_output or 'Binary files' in diff_output:
+                    file_data['hunks'].append({
+                        'type': 'new_file',
+                        'added_lines': ['[New file or binary change]'],
+                        'removed_lines': [],
+                        'context_lines': [],
+                        'line_start': 1,
+                        'line_end': 1
+                    })
+
         return files
