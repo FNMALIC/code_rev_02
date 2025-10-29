@@ -51,27 +51,6 @@ cp .env.example .env
 5. Update the README.md if needed
 6. Submit your pull request with a clear description
 
-## Areas for Contribution
-
-### High Priority
-- [ ] Multi-language support (JavaScript, Java, C++)
-- [ ] Performance optimizations
-- [ ] Additional security analysis rules
-- [ ] Web interface development
-- [ ] IDE plugin development
-
-### Medium Priority
-- [ ] Enhanced documentation and tutorials
-- [ ] Additional baseline models
-- [ ] Improved interpretability features
-- [ ] CI/CD pipeline setup
-- [ ] Docker containerization
-
-### Low Priority
-- [ ] Code refactoring and cleanup
-- [ ] Additional test coverage
-- [ ] Performance benchmarking
-- [ ] Example notebooks and demos
 
 ## Reporting Issues
 
@@ -90,17 +69,6 @@ For feature requests, please:
 - Provide examples of how it would work
 - Consider implementation complexity
 
-## Code of Conduct
 
-- Be respectful and inclusive
-- Focus on constructive feedback
-- Help others learn and grow
-- Maintain a professional tone in all interactions
 
-## Questions?
 
-If you have questions about contributing, feel free to:
-- Open an issue for discussion
-- Contact the maintainer: fonkou.nixon@example.com
-
-Thank you for contributing!
