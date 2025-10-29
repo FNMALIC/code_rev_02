@@ -16,8 +16,8 @@ data:
   test_split: 0.1
 
 external_ai:
-  api_key: "AIzaSyBOUCDxmn1o_7qCydXFyuv8gkpn4XOYRCM"
-  model: "gpt-3.5-turbo"
+  api_key: "${EXTERNAL_AI_API_KEY}"
+  model: "${EXTERNAL_AI_MODEL}"
 
 evaluation:
   metrics: ["accuracy", "f1", "precision", "recall", "auc"]
